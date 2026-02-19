@@ -1,5 +1,6 @@
+using System.Runtime.InteropServices;
 using System.Text.Json;
-using Microsoft.Playwright;
+using PuppeteerSharp;
 
 var app = new BrowserCommandApp();
 await app.RunAsync();
@@ -7,7 +8,7 @@ await app.RunAsync();
 internal sealed class BrowserCommandApp : IAsyncDisposable
 {
     private readonly Dictionary<Guid, BrowserSession> sessions = new();
-    private IPlaywright? playwright;
+    private readonly BrowserLaunchConfig launchConfig = BrowserLaunchConfig.FromEnvironment();
     private IBrowser? browser;
     private Guid? activeSessionId;
 
@@ -99,11 +100,109 @@ internal sealed class BrowserCommandApp : IAsyncDisposable
             return;
         }
 
-        playwright = await Playwright.CreateAsync();
-        browser = await playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions
+        var chromiumPath = ResolveChromiumPath(launchConfig);
+
+        if (chromiumPath is null && launchConfig.AllowDownloadChromium)
         {
-            Headless = true
-        });
+            Console.WriteLine("Downloading compatible Chromium (first run)…");
+            var fetcher = new BrowserFetcher();
+            await fetcher.DownloadAsync();
+        }
+
+        var launchArgs = new List<string>
+        {
+            "--no-sandbox",
+            "--disable-gpu",
+            "--font-render-hinting=none",
+            "--hide-scrollbars"
+        };
+
+        if (launchConfig.ExtraChromiumArgs.Count > 0)
+        {
+            launchArgs.AddRange(launchConfig.ExtraChromiumArgs);
+        }
+
+        var launchOptions = new LaunchOptions
+        {
+            Headless = true,
+            ExecutablePath = chromiumPath,
+            Args = launchArgs.ToArray()
+        };
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(launchConfig.TimeoutSeconds));
+        browser = await Puppeteer.LaunchAsync(launchOptions).WaitAsync(cts.Token);
+    }
+
+    private static string? ResolveChromiumPath(BrowserLaunchConfig cfg)
+    {
+        // Prefer an explicit path if provided.
+        string? chromiumPath = cfg switch
+        {
+            { } when !string.IsNullOrWhiteSpace(cfg.ChromiumPath) && File.Exists(cfg.ChromiumPath) => cfg.ChromiumPath,
+            _ => null
+        };
+
+        if (chromiumPath is null)
+        {
+            IEnumerable<string> candidates = Array.Empty<string>();
+
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            {
+                candidates =
+                [
+                    "/usr/bin/chromium",
+                    "/usr/bin/chromium-browser",
+                    "/usr/bin/google-chrome",
+                    "/usr/bin/chrome"
+                ];
+            }
+            else if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                var pf = Environment.GetEnvironmentVariable("ProgramFiles") ?? @"C:\Program Files";
+                var pfx86 = Environment.GetEnvironmentVariable("ProgramFiles(x86)") ?? @"C:\Program Files (x86)";
+                var lad = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+
+                candidates =
+                [
+                    Path.Combine(pf, "Google", "Chrome", "Application", "chrome.exe"),
+                    Path.Combine(pfx86, "Google", "Chrome", "Application", "chrome.exe"),
+                    Path.Combine(pf, "Microsoft", "Edge", "Application", "msedge.exe"),
+                    Path.Combine(pfx86, "Microsoft", "Edge", "Application", "msedge.exe"),
+                    Path.Combine(lad, "Chromium", "Application", "chrome.exe")
+                ];
+            }
+            else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+            {
+                candidates =
+                [
+                    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+                    "/Applications/Chromium.app/Contents/MacOS/Chromium"
+                ];
+            }
+
+            foreach (var candidate in candidates)
+            {
+                if (File.Exists(candidate))
+                {
+                    chromiumPath = candidate;
+                    break;
+                }
+            }
+
+            if (chromiumPath is null)
+            {
+                var env = Environment.GetEnvironmentVariable("PUPPETEER_EXECUTABLE_PATH")
+                          ?? Environment.GetEnvironmentVariable("CHROME_PATH");
+
+                if (!string.IsNullOrWhiteSpace(env) && File.Exists(env))
+                {
+                    chromiumPath = env;
+                }
+            }
+        }
+
+        return chromiumPath;
     }
 
     private async Task NewSessionAsync()
@@ -111,7 +210,7 @@ internal sealed class BrowserCommandApp : IAsyncDisposable
         await EnsureBrowserAsync();
 
         var sessionId = Guid.NewGuid();
-        var context = await browser!.NewContextAsync();
+        var context = await browser!.CreateBrowserContextAsync();
         var page = await context.NewPageAsync();
 
         sessions[sessionId] = new BrowserSession(sessionId, context, page);
@@ -170,15 +269,15 @@ internal sealed class BrowserCommandApp : IAsyncDisposable
             return;
         }
 
-        await session.Page.GotoAsync(args, new PageGotoOptions
+        await session.Page.GoToAsync(args, new NavigationOptions
         {
-            WaitUntil = WaitUntilState.NetworkIdle
+            WaitUntil =
+            [
+                WaitUntilNavigation.Networkidle0
+            ]
         });
 
-        var snapshot = await session.Page.Accessibility.SnapshotAsync(new AccessibilitySnapshotOptions
-        {
-            InterestingOnly = false
-        });
+        var snapshot = await session.Page.Accessibility.SnapshotAsync();
 
         var json = JsonSerializer.Serialize(snapshot, new JsonSerializerOptions
         {
@@ -215,9 +314,8 @@ internal sealed class BrowserCommandApp : IAsyncDisposable
         await EnsureViewportAsync(session, width, height);
         var outputPath = $"{baseFileName}.jpg";
 
-        await session.Page.ScreenshotAsync(new PageScreenshotOptions
+        await session.Page.ScreenshotAsync(outputPath, new ScreenshotOptions
         {
-            Path = outputPath,
             Type = ScreenshotType.Jpeg,
             FullPage = false
         });
@@ -231,8 +329,8 @@ internal sealed class BrowserCommandApp : IAsyncDisposable
         if (parts.Length != 4
             || !int.TryParse(parts[0], out var width)
             || !int.TryParse(parts[1], out var height)
-            || !float.TryParse(parts[2], out var x)
-            || !float.TryParse(parts[3], out var y))
+            || !decimal.TryParse(parts[2], out var x)
+            || !decimal.TryParse(parts[3], out var y))
         {
             Console.WriteLine("error: send-click requires [width] [height] [x] [y]");
             return;
@@ -274,7 +372,12 @@ internal sealed class BrowserCommandApp : IAsyncDisposable
             return;
         }
 
-        await session.Page.SetViewportSizeAsync(width, height);
+        await session.Page.SetViewportAsync(new ViewPortOptions
+        {
+            Width = width,
+            Height = height
+        });
+
         session.ViewportWidth = width;
         session.ViewportHeight = height;
     }
@@ -291,9 +394,8 @@ internal sealed class BrowserCommandApp : IAsyncDisposable
         if (browser is not null)
         {
             await browser.CloseAsync();
+            await browser.DisposeAsync();
         }
-
-        playwright?.Dispose();
     }
 
     private sealed class BrowserSession(Guid id, IBrowserContext context, IPage page)
@@ -303,5 +405,42 @@ internal sealed class BrowserCommandApp : IAsyncDisposable
         public IPage Page { get; } = page;
         public int? ViewportWidth { get; set; }
         public int? ViewportHeight { get; set; }
+    }
+
+    private sealed class BrowserLaunchConfig
+    {
+        public string? ChromiumPath { get; init; }
+        public bool AllowDownloadChromium { get; init; }
+        public int TimeoutSeconds { get; init; } = 30;
+        public IReadOnlyList<string> ExtraChromiumArgs { get; init; } = [];
+
+        public static BrowserLaunchConfig FromEnvironment()
+        {
+            var timeout = 30;
+            if (int.TryParse(Environment.GetEnvironmentVariable("CFAGENT_TIMEOUT_SECONDS"), out var parsedTimeout) && parsedTimeout > 0)
+            {
+                timeout = parsedTimeout;
+            }
+
+            var allowDownload = true;
+            var allowDownloadValue = Environment.GetEnvironmentVariable("CFAGENT_ALLOW_DOWNLOAD_CHROMIUM");
+            if (bool.TryParse(allowDownloadValue, out var parsedAllowDownload))
+            {
+                allowDownload = parsedAllowDownload;
+            }
+
+            var chromiumPath = Environment.GetEnvironmentVariable("CFAGENT_CHROMIUM_PATH");
+            var extraArgs = Environment.GetEnvironmentVariable("CFAGENT_EXTRA_CHROMIUM_ARGS")
+                ?.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+                .ToArray() ?? [];
+
+            return new BrowserLaunchConfig
+            {
+                ChromiumPath = chromiumPath,
+                AllowDownloadChromium = allowDownload,
+                TimeoutSeconds = timeout,
+                ExtraChromiumArgs = extraArgs
+            };
+        }
     }
 }
