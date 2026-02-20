@@ -398,10 +398,10 @@ internal sealed class BrowserCommandApp : IAsyncDisposable
         }
     }
 
-    private sealed class BrowserSession(Guid id, IBrowserContext context, IPage page)
+    private sealed class BrowserSession(Guid id, BrowserContext context, IPage page)
     {
         public Guid Id { get; } = id;
-        public IBrowserContext Context { get; } = context;
+        public BrowserContext Context { get; } = context;
         public IPage Page { get; } = page;
         public int? ViewportWidth { get; set; }
         public int? ViewportHeight { get; set; }
