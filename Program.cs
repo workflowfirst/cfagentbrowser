@@ -130,7 +130,7 @@ internal sealed class BrowserCommandApp : IAsyncDisposable
         };
 
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(launchConfig.TimeoutSeconds));
-        browser = await Puppeteer.LaunchAsync(launchOptions, cts.Token);
+        browser = await Puppeteer.LaunchAsync(launchOptions).WaitAsync(cts.Token);
     }
 
     private static string? ResolveChromiumPath(BrowserLaunchConfig cfg)
@@ -329,8 +329,8 @@ internal sealed class BrowserCommandApp : IAsyncDisposable
         if (parts.Length != 4
             || !int.TryParse(parts[0], out var width)
             || !int.TryParse(parts[1], out var height)
-            || !float.TryParse(parts[2], out var x)
-            || !float.TryParse(parts[3], out var y))
+            || !decimal.TryParse(parts[2], out var x)
+            || !decimal.TryParse(parts[3], out var y))
         {
             Console.WriteLine("error: send-click requires [width] [height] [x] [y]");
             return;
