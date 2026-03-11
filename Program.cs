@@ -30,7 +30,7 @@ public sealed partial class BrowserCommandApp : IAsyncDisposable
 	private static readonly AsyncLocal<Guid?> RoutedSessionId = new();
 	private static int routedConsoleInstalled;
 
-	private static void WriteDebugLine(string text)
+	internal static void WriteDebugLine(string text)
 	{
 		Console.WriteLine(text);
 		if (RoutedOutput.Value is not null)
@@ -1067,6 +1067,7 @@ public sealed partial class BrowserCommandApp : IAsyncDisposable
 	public async Task RunAsync(string[] args)
 	{
 		EnsureRoutedConsole();
+		ApplyStartupArgs(args);
 
 		if (await TryRunWebServerAsync(args))
 		{
@@ -1168,6 +1169,10 @@ public sealed partial class BrowserCommandApp : IAsyncDisposable
 			case "--alt":
 				ToggleAlternativeProbe();
 				break;
+			case "alt-debug":
+			case "--alt-debug":
+				HandleAltDebugToggle(args);
+				break;
 			case "quit":
 				Console.WriteLine("bye");
 				return true;
@@ -1198,6 +1203,82 @@ public sealed partial class BrowserCommandApp : IAsyncDisposable
 		Console.WriteLine(useAlternativeInteractableProbe
 			? "ok: --alt enabled (using cursor/hover interactable probe for snapshots)"
 			: "ok: --alt disabled (using accessibility snapshot path)");
+	}
+
+	private static void HandleAltDebugToggle(string args)
+	{
+		var mode = (args ?? string.Empty).Trim().ToLowerInvariant();
+		var current = IsAltDebugEnabled();
+
+		if (string.IsNullOrWhiteSpace(mode) || mode is "status")
+		{
+			Console.WriteLine(current ? "ok: alt-debug is ON" : "ok: alt-debug is OFF");
+			return;
+		}
+
+		if (mode is "1" or "on" or "true" or "yes")
+		{
+			Environment.SetEnvironmentVariable("CFAGENT_ALT_DEBUG", "1");
+			Console.WriteLine("ok: alt-debug enabled");
+			return;
+		}
+
+		if (mode is "0" or "off" or "false" or "no")
+		{
+			Environment.SetEnvironmentVariable("CFAGENT_ALT_DEBUG", "0");
+			Console.WriteLine("ok: alt-debug disabled");
+			return;
+		}
+
+		Console.WriteLine("error: alt-debug expects on|off|status");
+	}
+
+	private static bool IsAltDebugEnabled()
+	{
+		var raw = Environment.GetEnvironmentVariable("CFAGENT_ALT_DEBUG");
+		if (string.IsNullOrWhiteSpace(raw)) return false;
+		raw = raw.Trim();
+		return raw.Equals("1", StringComparison.OrdinalIgnoreCase)
+			|| raw.Equals("true", StringComparison.OrdinalIgnoreCase)
+			|| raw.Equals("yes", StringComparison.OrdinalIgnoreCase)
+			|| raw.Equals("on", StringComparison.OrdinalIgnoreCase);
+	}
+
+	private static void ApplyStartupArgs(string[] args)
+	{
+		if (args is null || args.Length == 0) return;
+
+		string? requested = null;
+		for (var i = 0; i < args.Length; i++)
+		{
+			var arg = args[i] ?? string.Empty;
+
+			if (string.Equals(arg, "--alt-debug", StringComparison.OrdinalIgnoreCase))
+			{
+				// Allow: --alt-debug on|off|status ; default to "on" when no value supplied.
+				if (i + 1 < args.Length && !args[i + 1].StartsWith("--", StringComparison.Ordinal))
+				{
+					requested = args[i + 1];
+					i++;
+				}
+				else
+				{
+					requested = "on";
+				}
+				continue;
+			}
+
+			const string prefix = "--alt-debug=";
+			if (arg.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+			{
+				requested = arg[prefix.Length..];
+			}
+		}
+
+		if (!string.IsNullOrWhiteSpace(requested))
+		{
+			HandleAltDebugToggle(requested);
+		}
 	}
 
 	// --- Crash-resilience: record Chromium PID(s) so we can clean up after crashes ---
@@ -3088,6 +3169,9 @@ static bool TryParsePoint(string s, out decimal x, out decimal y)
 	{
 		try
 		{
+			// Ensure grouping targets are current for this page before assigning collected items.
+			await session.UpdateScrollTargetsFromDomAsync();
+
 			var items = await AlternativeInteractableTextGatherer.CollectAsync(
 				session.Page,
 				maxElements: maxElements,
@@ -3143,6 +3227,24 @@ static bool TryParsePoint(string s, out decimal x, out decimal y)
 					.ToList();
 				sbAlt.AppendLine($"-- {kvp.Key} element 0/0 --");
 				sbAlt.Append(AlternativeInteractableTextGatherer.ToSnapshotText(list, maxLines: maxLinesPerGroup));
+			}
+
+			// Safety fallback: if grouping produced nothing but we did collect items, print all under fallback.
+			if (sbAlt.Length == 0 && items.Count > 0)
+			{
+				var flat = items
+					.OrderBy(i => i.Y)
+					.ThenBy(i => i.X)
+					.ThenBy(i => i.Name, StringComparer.OrdinalIgnoreCase)
+					.ToList();
+				sbAlt.AppendLine($"-- {fallbackCode} document 0/0 --");
+				sbAlt.Append(AlternativeInteractableTextGatherer.ToSnapshotText(flat, maxLines: maxLinesPerGroup));
+			}
+
+			if (IsAltDebugEnabled())
+			{
+				var nonEmptyGroups = grouped.Count(k => k.Value.Count > 0);
+				WriteDebugLine($"debug alt-group: items={items.Count} scrollTargets={session.ScrollTargets.Count} groups={grouped.Count} nonEmptyGroups={nonEmptyGroups} outChars={sbAlt.Length}");
 			}
 
 			PrintDumpText(session, sbAlt.ToString(), compactOutput);

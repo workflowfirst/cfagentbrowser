@@ -166,7 +166,7 @@ public static class AlternativeInteractableTextGatherer
     try {
       if (!el || el.nodeType !== 1) return '';
       const clone = el.cloneNode(true);
-      const remove = clone.querySelectorAll('option,optgroup,select,.ToolText');
+      const remove = clone.querySelectorAll('option,optgroup,select,.ToolText,script,style,noscript,template');
       for (const n of remove) n.remove();
       return norm(clone.innerText || clone.textContent || '');
     } catch {
@@ -204,6 +204,7 @@ public static class AlternativeInteractableTextGatherer
       if (!el || el.nodeType !== 1) return true;
       const tag = String(el.tagName || '').toLowerCase();
       if (tag === 'option' || tag === 'optgroup') return true;
+      if (tag === 'script' || tag === 'style' || tag === 'noscript' || tag === 'template') return true;
       if (el.classList && el.classList.contains('ToolText')) return true;
       return false;
     } catch {
@@ -407,16 +408,23 @@ public static class AlternativeInteractableTextGatherer
     try {
       const cs = window.getComputedStyle(el);
       const c = String((cs && cs.cursor) || '').toLowerCase();
-      if (c === 'pointer') kinds.add('pointer');
-      if (c === 'text') kinds.add('text');
+      const parent = el.parentElement;
+      const pcs = parent ? window.getComputedStyle(parent) : null;
+      const pc = String((pcs && pcs.cursor) || '').toLowerCase();
+      const inlineCursor = String((el.style && el.style.cursor) || '').trim().toLowerCase();
+      const hasOwnCursorSignal = !!inlineCursor || c !== pc;
+
+      // Avoid treating inherited page-wide cursor styles as interactivity signals.
+      if (hasOwnCursorSignal && c === 'pointer') kinds.add('pointer');
+      if (hasOwnCursorSignal && c === 'text') kinds.add('text');
 
       // Some UIs only switch cursor on hover.
       try {
         el.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
         const cs2 = window.getComputedStyle(el);
         const c2 = String((cs2 && cs2.cursor) || '').toLowerCase();
-        if (c2 === 'pointer') kinds.add('pointer-hover');
-        if (c2 === 'text') kinds.add('text-hover');
+        if (c2 === 'pointer' && c2 !== pc) kinds.add('pointer-hover');
+        if (c2 === 'text' && c2 !== pc) kinds.add('text-hover');
         el.dispatchEvent(new MouseEvent('mouseleave', { bubbles: true }));
       } catch {}
     } catch {}
@@ -511,9 +519,10 @@ public static class AlternativeInteractableTextGatherer
     if (!el || !isVisible(el)) continue;
     if (isExcludedElement(el)) continue;
 
+    const nativeInteractable = isNativeInteractable(el);
     const cursors = cursorKinds(el);
     const hover = hasHoverRule(el);
-    if (cursors.length || hover) continue;
+    if (nativeInteractable || cursors.length || hover) continue;
 
     const pt = centerPoint(el);
     if (!pt) continue;
@@ -569,7 +578,7 @@ public static class AlternativeInteractableTextGatherer
 
         if (items is null || items.Length == 0)
         {
-            return Array.Empty<InteractableElement>();
+        return Array.Empty<InteractableElement>();
         }
 
         static string Norm(string s)
@@ -834,6 +843,29 @@ public static class AlternativeInteractableTextGatherer
             result.Add(resolved);
         }
 
+        if (IsAltDebugEnabled())
+        {
+            var rawInteractable = 0;
+            var rawText = 0;
+            foreach (var i in items)
+            {
+                if (i.IsInteractable) rawInteractable++;
+                else rawText++;
+            }
+
+            var suspiciousCodeLike = 0;
+            foreach (var r in result)
+            {
+                if (LooksLikeCodeOrCss(r.Name)) suspiciousCodeLike++;
+            }
+
+            BrowserCommandApp.WriteDebugLine(
+                $"debug alt: raw={items.Length} rawInteractable={rawInteractable} rawText={rawText} " +
+                $"labeledInteractable={interactables.Count} labeledText={textOnly.Count} " +
+                $"filteredInteractable={filteredInteractables.Count} filteredText={filteredTextOnly.Count} " +
+                $"out={result.Count} codeLike={suspiciousCodeLike}");
+        }
+
         return result;
 
         static bool ContainsPoint(LabeledCandidate box, int x, int y)
@@ -873,6 +905,30 @@ public static class AlternativeInteractableTextGatherer
         {
             if (string.IsNullOrWhiteSpace(s)) return 0;
             return s.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length;
+        }
+
+        static bool IsAltDebugEnabled()
+        {
+            var raw = Environment.GetEnvironmentVariable("CFAGENT_ALT_DEBUG");
+            if (string.IsNullOrWhiteSpace(raw)) return false;
+            raw = raw.Trim();
+            return raw.Equals("1", StringComparison.OrdinalIgnoreCase)
+                || raw.Equals("true", StringComparison.OrdinalIgnoreCase)
+                || raw.Equals("yes", StringComparison.OrdinalIgnoreCase)
+                || raw.Equals("on", StringComparison.OrdinalIgnoreCase);
+        }
+
+        static bool LooksLikeCodeOrCss(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return false;
+            var t = s.Trim();
+            if (t.Length < 20) return false;
+            var lower = t.ToLowerInvariant();
+            if (lower.Contains("{") && lower.Contains("}") && lower.Contains(";")) return true;
+            if (lower.Contains("function(") || lower.Contains("function ") || lower.Contains("=>")) return true;
+            if (lower.Contains("var ") || lower.Contains("const ") || lower.Contains("let ")) return true;
+            if (lower.Contains("body{") || lower.Contains("@media") || lower.Contains(".css")) return true;
+            return false;
         }
     }
 
